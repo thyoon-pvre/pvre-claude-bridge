@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- install.sh 가 @NODE_BIN@ · @BRIDGE_DIR@ · @PORT@ 를 실제 값으로 바꿔 ~/Library/LaunchAgents 에 쓴다. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.pvre.claude-bridge</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>@NODE_BIN@</string>
+    <string>@BRIDGE_DIR@/server.mjs</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PVRE_BRIDGE_PORT</key>
+    <string>@PORT@</string>
+    <!-- launchd 의 PATH 는 좁다. claude·node 가 있는 경로를 직접 넣어 준다. -->
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <!-- 실행 주체가 launchd 임을 확인할 수 있게 남긴다. -->
+  <key>StandardOutPath</key>
+  <string>/tmp/pvre-bridge.out</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/pvre-bridge.err</string>
+</dict>
+</plist>

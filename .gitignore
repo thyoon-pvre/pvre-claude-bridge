@@ -1,0 +1,7 @@
+# 로컬 설정·토큰·로그는 ~/.config/pvre, ~/.local/state/pvre 에만 둔다. 여기 생기면 커밋하지 않는다.
+bridge.json
+bridge-token*
+*.log
+# 도구 캐시
+/graft/
+.DS_Store

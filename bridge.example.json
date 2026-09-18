@@ -1,0 +1,5 @@
+{
+  "allowedOrigins": [
+    "https://pvre-threads-publish.vercel.app"
+  ]
+}
