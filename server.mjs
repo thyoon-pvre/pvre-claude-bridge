@@ -1,5 +1,10 @@
 #!/usr/bin/env node
-// PVRE 로컬 Claude 브리지 v0
+// PVRE 로컬 Claude 브리지 v0 (+ Codex 엔진, v0.2.0)
+//
+// 엔진(PVRE_BRIDGE_ENGINE): claude(기본) | codex. 기동 시 한 번 정해지고 요청으로 바꿀 수 없다.
+//  codex 엔진은 같은 코드(인증·Origin·큐·로그 규칙 그대로)를 다른 포트·토큰·로그로 띄우고, 모델 호출만 `codex exec`로 바꾼다.
+//  codex 실행은 잠근다: 사용자 config.toml 무시(MCP·플러그인·훅 없음) · 셸/코드 실행·웹 검색·이미지·브라우저·하위 에이전트 끔 ·
+//  읽기 전용 샌드박스 · 빈 임시 작업 폴더 · 세션 기록 안 남김(--ephemeral). 응답은 마지막 메시지 파일에서만 읽는다.
 //
 // 서버(Vercel)는 Claude 를 부르지 않는다. 각 사용자의 브라우저가 자기 맥에서 도는
 // 이 프로그램을 직접 부르고, 이 프로그램이 `claude -p` 를 실행한다.
@@ -20,8 +25,10 @@ import {
 } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, dirname, isAbsolute } from 'node:path';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 
-const VERSION = '0.1.0';
+const VERSION = '0.2.0';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 설정 — 전부 환경변수. 기본값은 "운영", verify 모드면 별도 경로로 갈린다.
@@ -39,17 +46,22 @@ function expandHome(p) {
 // verify -> prod 로 되돌리는 경로를 코드에 두지 않는다. 검증 프로세스가 운영으로 승격되는 길을 막는다.
 const MODE = process.env.PVRE_BRIDGE_MODE === 'verify' ? 'verify' : 'prod';
 const IS_VERIFY = MODE === 'verify';
+// 엔진도 기동 시 한 번. 알 수 없는 값은 claude(기존 동작) — codex는 명시적으로 켤 때만.
+const ENGINE = process.env.PVRE_BRIDGE_ENGINE === 'codex' ? 'codex' : 'claude';
+const IS_CODEX = ENGINE === 'codex';
 
+// codex 엔진은 포트·토큰·로그를 claude 와 따로 쓴다(같은 맥에서 둘 다 띄운다).
+const SUFFIX = IS_CODEX ? '.codex' : '';
 const DEFAULTS = IS_VERIFY
   ? {
-      port: 8798,
-      tokenFile: join(homedir(), '.config/pvre/bridge-token.verify'),
-      logFile: join(homedir(), '.local/state/pvre/bridge.verify.log'),
+      port: IS_CODEX ? 8796 : 8798,
+      tokenFile: join(homedir(), `.config/pvre/bridge-token${SUFFIX}.verify`),
+      logFile: join(homedir(), `.local/state/pvre/bridge${SUFFIX}.verify.log`),
     }
   : {
-      port: 8799,
-      tokenFile: join(homedir(), '.config/pvre/bridge-token'),
-      logFile: join(homedir(), '.local/state/pvre/bridge.log'),
+      port: IS_CODEX ? 8797 : 8799,
+      tokenFile: join(homedir(), `.config/pvre/bridge-token${SUFFIX}`),
+      logFile: join(homedir(), `.local/state/pvre/bridge${SUFFIX}.log`),
     };
 
 const PORT = Number(process.env.PVRE_BRIDGE_PORT || DEFAULTS.port);
@@ -126,7 +138,7 @@ function tokenMatches(given) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 function resolveClaudeBin() {
-  const override = expandHome(process.env.PVRE_CLAUDE_BIN);
+  const override = expandHome(IS_CODEX ? process.env.PVRE_CODEX_BIN : process.env.PVRE_CLAUDE_BIN);
   if (override) return isAbsolute(override) && canExec(override) ? override : null;
   const dirs = [
     ...String(process.env.PATH || '').split(':').filter(Boolean),
@@ -136,7 +148,7 @@ function resolveClaudeBin() {
     '/usr/local/bin',
   ];
   for (const d of dirs) {
-    const p = join(d, 'claude');
+    const p = join(d, ENGINE);
     if (canExec(p)) return p;
   }
   return null;
@@ -153,7 +165,7 @@ let CLAUDE_BIN = resolveClaudeBin();
 // ─────────────────────────────────────────────────────────────────────────────
 
 function log(entry) {
-  const line = JSON.stringify({ ts: new Date().toISOString(), mode: MODE, ...entry });
+  const line = JSON.stringify({ ts: new Date().toISOString(), mode: MODE, engine: ENGINE, ...entry });
   try {
     mkdirSync(dirname(LOG_FILE), { recursive: true });
     appendFileSync(LOG_FILE, `${line}\n`);
@@ -239,6 +251,117 @@ function runClaude(prompt, timeoutMs) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// codex exec 실행 — claude 와 같은 계약(stdin 프롬프트 → 텍스트 응답). 도구를 잠그고 마지막 메시지만 돌려준다.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// 끄는 기능: 셸·코드 실행·하위 에이전트·이미지·브라우저·컴퓨터 제어·플러그인·앱·훅·기억·스킬 검색.
+// codex 버전마다 기능 이름이 다를 수 있다 — 모르는 이름은 codex 가 무시한다(0.162.1 에서 확인).
+const CODEX_DISABLE = [
+  'shell_tool', 'unified_exec', 'code_mode_host', 'multi_agent', 'image_generation', 'browser_use', 'computer_use',
+  'in_app_browser', 'view_image', 'plugins', 'apps', 'hooks', 'memories', 'skill_search', 'tool_suggest', 'goals',
+];
+
+function codexArgs(workDir, outFile) {
+  const args = [
+    'exec',
+    '--ephemeral',               // 세션 기록(~/.codex/sessions)에 메일 원문을 남기지 않는다
+    '--skip-git-repo-check',
+    '--ignore-user-config',      // config.toml 의 MCP 서버(카톡·메일 등)·플러그인·notify 를 싣지 않는다. 인증은 CODEX_HOME 그대로
+    '--ignore-rules',
+    '--sandbox', 'read-only',
+    '-C', workDir,
+    '--color', 'never',
+    '-c', 'project_doc_max_bytes=0',
+    '-c', 'web_search="disabled"',
+    '-o', outFile,
+  ];
+  for (const f of CODEX_DISABLE) args.push('--disable', f);
+  if (process.env.PVRE_CODEX_MODEL) args.push('-m', process.env.PVRE_CODEX_MODEL);
+  if (process.env.PVRE_CODEX_REASONING) args.push('-c', `model_reasoning_effort="${process.env.PVRE_CODEX_REASONING.replace(/[^a-z]/g, '')}"`);
+  args.push('-');                // 프롬프트는 stdin
+  return args;
+}
+
+/**
+ * codex 의 stderr 에는 프롬프트가 그대로 다시 찍힌다("user\n<프롬프트>"). 그대로 돌려주면 메일 원문이 오류 메시지로 새어 나간다.
+ * codex 로그 형식의 ERROR 줄만 골라 앞 300자만 준다.
+ */
+export function codexErrorSummary(stderr) {
+  // 메일 본문에도 "Error:" 같은 줄이 있을 수 있다 → codex 자체 로그 형식(ISO 시각 + ERROR)인 줄만 쓴다.
+  const lines = String(stderr).split('\n').filter((l) => /^\d{4}-\d{2}-\d{2}T[\d:.]+Z\s+ERROR\s/.test(l));
+  return lines.slice(-2).join(' | ').slice(0, 300) || '(codex 로그에 오류 줄 없음 — 터미널에서 codex login status 확인)';
+}
+
+function runCodex(prompt, timeoutMs) {
+  return new Promise((resolve) => {
+    if (DRY_RUN) {
+      resolve({ ok: true, text: `[dry-run] codex 를 실행하지 않았다. prompt ${prompt.length}자.`, exitCode: 0 });
+      return;
+    }
+    if (!CLAUDE_BIN) {
+      CLAUDE_BIN = resolveClaudeBin();
+      if (!CLAUDE_BIN) {
+        resolve({ ok: false, code: 'CODEX_NOT_FOUND', error: 'codex CLI 를 찾지 못했다 (PATH 확인)' });
+        return;
+      }
+    }
+    let workDir;
+    try {
+      workDir = mkdtempSync(join(tmpdir(), 'pvre-codex-'));
+    } catch (e) {
+      resolve({ ok: false, code: 'NONZERO_EXIT', error: `임시 폴더를 만들지 못했다: ${e.message}` });
+      return;
+    }
+    const outFile = join(workDir, 'last-message.txt');
+    const cleanup = () => { try { rmSync(workDir, { recursive: true, force: true }); } catch (e) { console.error(`[bridge] 임시 폴더 정리 실패: ${e.message}`); } };
+
+    let child;
+    try {
+      child = spawn(CLAUDE_BIN, codexArgs(workDir, outFile), {
+        cwd: workDir,
+        stdio: ['pipe', 'pipe', 'pipe'],
+        detached: true, // codex.js → 네이티브 바이너리. 타임아웃 때 프로세스 그룹째 죽인다
+        // codex 는 `#!/usr/bin/env node` 스크립트다. launchd 의 좁은 PATH 에서도 이 node 를 찾게 앞에 붙인다.
+        env: { ...process.env, PATH: `${dirname(process.execPath)}:${process.env.PATH || '/usr/bin:/bin'}` },
+      });
+    } catch (e) {
+      cleanup();
+      resolve({ ok: false, code: 'CODEX_NOT_FOUND', error: `codex 실행 실패: ${e.message}` });
+      return;
+    }
+
+    let err = '';
+    let settled = false;
+    const finish = (r) => { if (!settled) { settled = true; clearTimeout(timer); cleanup(); resolve(r); } };
+    const timer = setTimeout(() => {
+      try { process.kill(-child.pid, 'SIGKILL'); } catch { try { child.kill('SIGKILL'); } catch { /* 이미 끝남 */ } }
+      finish({ ok: false, code: 'TIMEOUT', error: `${timeoutMs}ms 안에 끝나지 않아 중단했다` });
+    }, timeoutMs);
+
+    child.stdout.on('data', () => { /* 진행 출력은 버린다 — 응답은 -o 파일에서만 읽는다 */ });
+    child.stderr.on('data', (d) => { if (err.length < 200_000) err += d; });
+    child.on('error', (e) => finish({ ok: false, code: 'CODEX_NOT_FOUND', error: `codex 실행 실패: ${e.message}` }));
+    child.on('close', (code) => {
+      if (code !== 0) {
+        finish({ ok: false, code: 'NONZERO_EXIT', error: `codex 종료코드 ${code}: ${codexErrorSummary(err)}`, exitCode: code });
+        return;
+      }
+      let text = '';
+      try { text = readFileSync(outFile, 'utf8'); } catch (e) {
+        finish({ ok: false, code: 'NONZERO_EXIT', error: `codex 응답 파일을 읽지 못했다: ${e.message}`, exitCode: 0 });
+        return;
+      }
+      if (!text.trim()) finish({ ok: false, code: 'EMPTY_RESPONSE', error: 'codex 가 빈 응답을 냈다', exitCode: 0 });
+      else finish({ ok: true, text, exitCode: 0 });
+    });
+    child.stdin.on('error', (e) => finish({ ok: false, code: 'NONZERO_EXIT', error: `stdin 쓰기 실패: ${e.message}` }));
+    child.stdin.end(prompt);
+  });
+}
+
+const runEngine = IS_CODEX ? runCodex : runClaude;
+
+// ─────────────────────────────────────────────────────────────────────────────
 // HTTP
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -306,12 +429,16 @@ const server = createServer(async (req, res) => {
   // ── GET /v1/health — 인증 불필요. 민감정보를 담지 않는다.
   if (req.method === 'GET' && url.pathname === '/v1/health') {
     if (!CLAUDE_BIN) CLAUDE_BIN = resolveClaudeBin();
+    const engineAvailable = Boolean(CLAUDE_BIN) || DRY_RUN;
     send(res, 200, {
       ok: true,
       version: VERSION,
       mode: MODE,            // "verify" 가 보이지 않으면 사람이 착각한다
+      engine: ENGINE,        // 0.2.0 — 화면이 "Claude 자리에 Codex 브릿지"를 붙이지 않게 확인한다
+      engineAvailable,
       dryRun: DRY_RUN,
-      claudeAvailable: Boolean(CLAUDE_BIN) || DRY_RUN,
+      // 0.1.x 화면 호환: claude 엔진일 때만 true. codex 데몬을 Claude 자리에 붙이면 "claude 없음"으로 보인다
+      claudeAvailable: !IS_CODEX && engineAvailable,
       busy,
       queued,
       maxQueue: MAX_QUEUE,
@@ -372,7 +499,7 @@ const server = createServer(async (req, res) => {
     }
 
     const started = Date.now();
-    const result = await enqueue(() => runClaude(prompt, timeoutMs));
+    const result = await enqueue(() => runEngine(prompt, timeoutMs));
     const elapsedMs = Date.now() - started;
 
     log({ app, task, promptChars: prompt.length, elapsedMs, ok: result.ok, code: result.code || null });
@@ -396,14 +523,17 @@ server.on('error', (e) => {
 });
 
 server.listen(PORT, HOST, () => {
-  console.log(`[bridge] PVRE 로컬 Claude 브리지 v${VERSION}`);
+  console.log(`[bridge] PVRE 로컬 브리지 v${VERSION} — 엔진 ${ENGINE}`);
   console.log(`[bridge] 모드      : ${MODE}${DRY_RUN ? ' (dry-run)' : ''}`);
   console.log(`[bridge] 주소      : http://${HOST}:${PORT}`);
   console.log(`[bridge] 토큰 파일 : ${TOKEN_FILE}`);
   console.log(`[bridge] 로그 파일 : ${LOG_FILE}`);
-  console.log(`[bridge] claude    : ${CLAUDE_BIN || '찾지 못함 — claude CLI 설치 확인'}`);
+  console.log(`[bridge] ${ENGINE.padEnd(6)}    : ${CLAUDE_BIN || `찾지 못함 — ${ENGINE} CLI 설치 확인`}`);
   console.log(`[bridge] 허용 Origin: ${[...ALLOWED_ORIGINS].join(', ') || '(없음)'}`);
-  if (TOKEN_CREATED) {
+  if (TOKEN_CREATED && IS_CODEX) {
+    // codex 엔진은 토큰을 화면·launchd 로그(/tmp/*.out)에 찍지 않는다. 파일에서 클립보드로 복사하게 안내만 한다.
+    console.log(`[bridge] 토큰을 새로 만들었다(값은 출력하지 않는다): pbcopy < ${TOKEN_FILE}`);
+  } else if (TOKEN_CREATED) {
     console.log('');
     console.log('  ── 토큰을 새로 만들었다. 백오피스 /settings/bridge 에 붙여넣어라. ──');
     console.log(`  ${TOKEN}`);

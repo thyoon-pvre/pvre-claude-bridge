@@ -136,3 +136,32 @@ curl -s http://127.0.0.1:8799/v1/health
 - 사용자마다 CLI 모델 설정이 다를 수 있다 → 같은 프롬프트가 사람마다 다른 결과를 낼 수 있다.
   판정 재현성이 필요한 작업에는 `--model` 고정을 검토한다.
 - `KeepAlive` 는 맥이 잠들면 멈추고 깨어나면 돌아온다. 브리지는 요청 응답형이라 캐치업 문제가 없다.
+
+## Codex 엔진 (v0.2.0)
+
+같은 `server.mjs` 를 `PVRE_BRIDGE_ENGINE=codex` 로 띄우면 `claude -p` 대신 `codex exec` 를 부른다.
+인증(Bearer 토큰)·Origin 허용목록·127.0.0.1 바인딩·직렬 큐·로그 규칙(본문 미기록)은 그대로다. Claude 브리지와 **동시에** 따로 뜬다.
+
+| | Claude(기본) | Codex |
+|---|---|---|
+| launchd | `com.pvre.claude-bridge` | `com.pvre.codex-bridge` |
+| 포트 운영/검증 | 8799 / 8798 | 8797 / 8796 |
+| 토큰 | `~/.config/pvre/bridge-token` | `~/.config/pvre/bridge-token.codex` |
+| 로그 | `bridge.log` | `bridge.codex.log` |
+| 설치·제거·검증 | `install.sh` · `uninstall.sh` · `verify-bridge.sh` | `install-codex.sh` · `uninstall-codex.sh` · `verify-codex-bridge.sh` |
+
+```bash
+codex login status            # "Logged in using ChatGPT" 이어야 종량 과금이 없다(API 키 로그인은 호출마다 과금)
+./install-codex.sh            # 토큰을 만들되 화면에 찍지 않는다
+pbcopy < ~/.config/pvre/bridge-token.codex
+```
+
+`/v1/health` 에 `engine`("claude"|"codex")·`engineAvailable` 이 추가됐다. `claudeAvailable` 은 claude 엔진일 때만 true 다
+(0.1.x 화면에 Codex 데몬을 잘못 붙이면 "claude 없음"으로 보이게).
+
+codex 실행은 잠근다 — 메일 같은 외부 데이터를 넣기 때문이다:
+`--ignore-user-config`(config.toml 의 MCP·플러그인·notify 미적재) · `--disable shell_tool unified_exec code_mode_host multi_agent …`(셸·코드 실행·하위 에이전트·브라우저·이미지 끔)
+· `-c web_search="disabled"` · `--sandbox read-only` · 빈 임시 폴더(`-C`, 끝나면 삭제) · `--ephemeral`(세션 기록 안 남김) · 응답은 `-o` 마지막 메시지만.
+codex stderr 에는 프롬프트가 다시 찍히므로 오류 메시지에는 codex 로그 형식의 `ERROR` 줄만 300자까지 담는다.
+모델 고정: `PVRE_CODEX_MODEL`, 추론 강도: `PVRE_CODEX_REASONING`(plist EnvironmentVariables). `PVRE_CODEX_BIN` 으로 경로 지정.
+`~/.codex/AGENTS.md`(전역 지시)는 옵션으로 끌 수 없어 맥락에 들어간다 — `claude -p` 가 `~/.claude/CLAUDE.md` 를 읽는 것과 같다.
