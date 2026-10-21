@@ -1,5 +1,8 @@
 #!/usr/bin/env node
-// PVRE 로컬 Claude 브리지 v0 (+ Codex 엔진, v0.2.0)
+// PVRE 로컬 Claude 브리지 v0 (+ Codex 엔진, v0.2.0 · 클로브 조회 작업, v0.3.0)
+//
+// 클로브 작업(task = clobe.*, v0.3.0): 작업별 조회 도구만 허용한 `claude -p` 를 돌리고 MCP 도구 결과 원문을 돌려준다(clobe-tasks.mjs).
+//  claude 엔진에서만 받는다(codex 는 클로브 커넥터가 없다 → TASK_NOT_SUPPORTED). 그 밖의 작업은 0.2.0과 같은 인자로 실행한다(회귀 없음).
 //
 // 엔진(PVRE_BRIDGE_ENGINE): claude(기본) | codex. 기동 시 한 번 정해지고 요청으로 바꿀 수 없다.
 //  codex 엔진은 같은 코드(인증·Origin·큐·로그 규칙 그대로)를 다른 포트·토큰·로그로 띄우고, 모델 호출만 `codex exec`로 바꾼다.
@@ -27,8 +30,10 @@ import { homedir } from 'node:os';
 import { join, dirname, isAbsolute } from 'node:path';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { claudeProjectDirFor, claudeToolArgs, claudeToolEnv, isClobeTask, CLOBE_TASKS, judgeToolRun, parseToolStream } from './clobe-tasks.mjs';
+import { realpathSync } from 'node:fs';
 
-const VERSION = '0.2.0';
+const VERSION = '0.3.0';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 설정 — 전부 환경변수. 기본값은 "운영", verify 모드면 별도 경로로 갈린다.
@@ -362,6 +367,81 @@ function runCodex(prompt, timeoutMs) {
 const runEngine = IS_CODEX ? runCodex : runClaude;
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 클로브 조회 작업 — 허용 도구 목록 + stream-json 원문 수집 (v0.3.0)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const MAX_TOOL_STDOUT = 8 * 1024 * 1024; // 넘으면 중단 — 서버가 받는 본문 상한(4MB)보다 넉넉히
+
+function runClaudeTools(task, prompt, timeoutMs) {
+  return new Promise((resolve) => {
+    if (DRY_RUN) {
+      resolve({ ok: true, text: JSON.stringify({ format: 'pvre-bridge/tool-calls@1', task, calls: [], denied: [], final: '[dry-run]' }), exitCode: 0 });
+      return;
+    }
+    if (!CLAUDE_BIN) CLAUDE_BIN = resolveClaudeBin();
+    if (!CLAUDE_BIN) { resolve({ ok: false, code: 'CLAUDE_NOT_FOUND', error: 'claude CLI 를 찾지 못했다 (PATH 확인)' }); return; }
+    let workDir;
+    try { workDir = mkdtempSync(join(tmpdir(), 'pvre-clobe-')); } catch (e) {
+      resolve({ ok: false, code: 'NONZERO_EXIT', error: `임시 폴더를 만들지 못했다: ${e.message}` });
+      return;
+    }
+    let projectDir = null;
+    try { projectDir = claudeProjectDirFor(realpathSync(workDir), homedir()); } catch (e) { console.error(`[bridge] 작업 폴더 경로 확인 실패: ${e.message}`); }
+    // 임시 작업 폴더 + 그 폴더 몫으로 Claude Code 가 만든 프로젝트 폴더(큰 도구 결과 파일이 남는 곳)를 함께 지운다
+    const cleanup = () => {
+      for (const d of [workDir, projectDir]) {
+        if (!d || !d.includes('pvre-clobe-')) continue;
+        try { rmSync(d, { recursive: true, force: true }); } catch (e) { console.error(`[bridge] 임시 폴더 정리 실패: ${e.message}`); }
+      }
+    };
+    let child;
+    try {
+      child = spawn(CLAUDE_BIN, claudeToolArgs(task), { cwd: workDir, stdio: ['pipe', 'pipe', 'pipe'], env: claudeToolEnv() });
+    } catch (e) {
+      cleanup();
+      resolve({ ok: false, code: 'CLAUDE_NOT_FOUND', error: `claude 실행 실패: ${e.message}` });
+      return;
+    }
+    let out = '';
+    let err = '';
+    let settled = false;
+    const finish = (r) => { if (!settled) { settled = true; clearTimeout(timer); cleanup(); resolve(r); } };
+    const timer = setTimeout(() => {
+      try { child.kill('SIGKILL'); } catch { /* 이미 끝남 */ }
+      finish({ ok: false, code: 'TIMEOUT', error: `${timeoutMs}ms 안에 끝나지 않아 중단했다` });
+    }, timeoutMs);
+    child.stdout.on('data', (d) => {
+      out += d;
+      if (out.length > MAX_TOOL_STDOUT) {
+        try { child.kill('SIGKILL'); } catch { /* 이미 끝남 */ }
+        finish({ ok: false, code: 'OUTPUT_TOO_LARGE', error: '클로브 조회 결과가 8MB를 넘었다 — 기간을 줄여 다시 요청하세요' });
+      }
+    });
+    child.stderr.on('data', (d) => { if (err.length < 20_000) err += d; });
+    child.on('error', (e) => finish({ ok: false, code: 'CLAUDE_NOT_FOUND', error: `claude 실행 실패: ${e.message}` }));
+    child.on('close', (code) => {
+      if (code !== 0) {
+        // stderr 에 데이터 조각이 실릴 수 있다 — 앞 300자만
+        finish({ ok: false, code: 'NONZERO_EXIT', error: `claude 종료코드 ${code}: ${err.slice(0, 300)}`, exitCode: code });
+        return;
+      }
+      const verdict = judgeToolRun(task, parseToolStream(out, task));
+      finish(verdict.ok ? { ok: true, text: verdict.text, exitCode: 0 } : { ...verdict, exitCode: 0 });
+    });
+    child.stdin.on('error', (e) => finish({ ok: false, code: 'NONZERO_EXIT', error: `stdin 쓰기 실패: ${e.message}` }));
+    child.stdin.end(prompt);
+  });
+}
+
+/** 작업 종류 → 실행 함수. 클로브 작업이 아니면 0.2.0 그대로(runEngine) */
+function runnerFor(task) {
+  if (!isClobeTask(task)) return { run: (prompt, ms) => runEngine(prompt, ms) };
+  if (!Object.hasOwn(CLOBE_TASKS, task)) return { reject: { status: 400, body: { ok: false, code: 'UNKNOWN_TASK', error: `알 수 없는 클로브 작업: ${task}` } } };
+  if (IS_CODEX) return { reject: { status: 200, body: { ok: false, code: 'TASK_NOT_SUPPORTED', error: '클로브 조회는 Claude 브릿지에서만 받는다(Codex에는 클로브 커넥터가 없다)' } } };
+  return { run: (prompt, ms) => runClaudeTools(task, prompt, ms) };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // HTTP
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -436,6 +516,8 @@ const server = createServer(async (req, res) => {
       mode: MODE,            // "verify" 가 보이지 않으면 사람이 착각한다
       engine: ENGINE,        // 0.2.0 — 화면이 "Claude 자리에 Codex 브릿지"를 붙이지 않게 확인한다
       engineAvailable,
+      // 0.3.0 — 이 데몬이 받는 클로브 조회 작업(codex 엔진은 없음)
+      tasks: IS_CODEX ? [] : Object.keys(CLOBE_TASKS),
       dryRun: DRY_RUN,
       // 0.1.x 화면 호환: claude 엔진일 때만 true. codex 데몬을 Claude 자리에 붙이면 "claude 없음"으로 보인다
       claudeAvailable: !IS_CODEX && engineAvailable,
@@ -492,6 +574,13 @@ const server = createServer(async (req, res) => {
       MAX_TIMEOUT_MS,
     );
 
+    const runner = runnerFor(task);
+    if (runner.reject) {
+      log({ app, task, promptChars: prompt.length, ok: false, code: runner.reject.body.code });
+      send(res, runner.reject.status, runner.reject.body);
+      return;
+    }
+
     if (queued >= MAX_QUEUE) {
       log({ app, task, promptChars: prompt.length, ok: false, code: 'QUEUE_FULL' });
       send(res, 200, { ok: false, code: 'QUEUE_FULL', error: `대기열이 찼다 (최대 ${MAX_QUEUE})` });
@@ -499,7 +588,7 @@ const server = createServer(async (req, res) => {
     }
 
     const started = Date.now();
-    const result = await enqueue(() => runEngine(prompt, timeoutMs));
+    const result = await enqueue(() => runner.run(prompt, timeoutMs));
     const elapsedMs = Date.now() - started;
 
     log({ app, task, promptChars: prompt.length, elapsedMs, ok: result.ok, code: result.code || null });

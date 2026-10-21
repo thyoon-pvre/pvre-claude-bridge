@@ -165,3 +165,14 @@ codex 실행은 잠근다 — 메일 같은 외부 데이터를 넣기 때문이
 codex stderr 에는 프롬프트가 다시 찍히므로 오류 메시지에는 codex 로그 형식의 `ERROR` 줄만 300자까지 담는다.
 모델 고정: `PVRE_CODEX_MODEL`, 추론 강도: `PVRE_CODEX_REASONING`(plist EnvironmentVariables). `PVRE_CODEX_BIN` 으로 경로 지정.
 `~/.codex/AGENTS.md`(전역 지시)는 옵션으로 끌 수 없어 맥락에 들어간다 — `claude -p` 가 `~/.claude/CLAUDE.md` 를 읽는 것과 같다.
+
+## 클로브 조회 작업 (v0.3.0)
+
+`task` 가 `clobe.pull_invoices` / `clobe.pull_bank` 이면 브릿지는 `claude -p` 를 **조회 도구만 허용**한 채 실행하고, 모델 요약이 아니라
+MCP 도구 결과 원문을 봉투(`pvre-bridge/tool-calls@1`)로 돌려준다. 정의·잠금 인자는 `clobe-tasks.mjs`, 테스트는 `node --test test/`.
+
+- 허용 도구: invoices = `get_my_context`·`get_tax_invoices` / bank = `get_my_context`·`get_bank_accounts`·`get_labeled_transactions`. 쓰기 도구는 어떤 작업에도 없다.
+- 잠금: `--tools ToolSearch`(내장 도구 0) · `--allowedTools` · `--permission-mode dontAsk` · `--setting-sources ""` · `--no-session-persistence` · 빈 임시 cwd. 출력에 허용 밖 도구가 보이면 결과 전체를 버린다.
+- 클로브는 claude.ai 계정 커넥터("claude.ai colbe")로 붙어 있어야 한다. 이름이 다르면 `PVRE_CLOBE_TOOL_PREFIX` 로 접두어를 바꾼다.
+- 계좌번호는 끝 4자리(`accountLast4`)만, 잔액 키는 지운 뒤 넘긴다. 실행 뒤 임시 cwd 와 그 몫의 `~/.claude/projects/<cwd>` 를 지운다(큰 도구 결과가 파일로 남는 곳).
+- Codex 엔진은 클로브 작업을 받지 않는다(`TASK_NOT_SUPPORTED`). 그 밖의 작업은 0.2.0과 같은 인자로 실행한다.
