@@ -176,3 +176,31 @@ MCP 도구 결과 원문을 봉투(`pvre-bridge/tool-calls@1`)로 돌려준다. 
 - 클로브는 claude.ai 계정 커넥터("claude.ai colbe")로 붙어 있어야 한다. 이름이 다르면 `PVRE_CLOBE_TOOL_PREFIX` 로 접두어를 바꾼다.
 - 계좌번호는 끝 4자리(`accountLast4`)만, 잔액 키는 지운 뒤 넘긴다. 실행 뒤 임시 cwd 와 그 몫의 `~/.claude/projects/<cwd>` 를 지운다(큰 도구 결과가 파일로 남는 곳).
 - Codex 엔진은 클로브 작업을 받지 않는다(`TASK_NOT_SUPPORTED`). 그 밖의 작업은 0.2.0과 같은 인자로 실행한다.
+
+## 상시 작업자 모드 (v0.4.0, `worker.mjs`)
+
+브라우저를 열어 두지 않아도 이 맥이 **발주시스템(pvre-order)의 메일 해석 작업을 직접 끌어와** 로컬 `claude -p`(기본) 또는 `codex exec`로 처리한다.
+HTTP 브리지(`server.mjs`, 127.0.0.1)와 별개 프로세스다(`com.pvre.ai-worker`). 둘 다 켜 둬도 서버가 같은 작업을 한 곳에만 준다.
+
+```bash
+# 1) 발주시스템 › 내 AI 연결 › 상시 작업자 기기 › [기기 토큰 발급](총괄) → [토큰 복사]
+# 2) 클립보드에서 바로 600 파일로(화면·셸 기록에 남기지 않는다)
+mkdir -p ~/.config/pvre && (umask 077; pbpaste > ~/.config/pvre/worker-token)
+#    또는 키체인: security add-generic-password -U -a "$USER" -s pvre-ai-worker -w "$(pbpaste)"
+# 3) 설치(launchd). --dry-run 은 plist 만 만들어 보여 준다
+PVRE_WORKER_SERVER=https://pvre-order-prototype.vercel.app ./install-worker.sh
+#    키체인: PVRE_WORKER_KEYCHAIN_SERVICE=pvre-ai-worker … / Codex: PVRE_WORKER_ENGINE=codex …
+# 제거: ./uninstall-worker.sh   (서버 쪽 토큰은 화면에서 [폐기])
+```
+
+| 항목 | 동작 |
+|---|---|
+| 서버 API | `POST /api/claude/worker/presence · /claim · /jobs/:id/complete`, `Authorization: Bearer pvw1_…` |
+| 주기 | 연결 신호 60초 · 빈 큐면 20초 쉼(`PVRE_WORKER_IDLE_MS`) · 긴 폴링 `PVRE_WORKER_WAIT_SEC`(0~20, 기본 0) |
+| 실패 | 네트워크·5xx 지수 백오프 5초→10분 · 401(폐기) 10분 · 완료 전송 일시 실패는 같은 작업표로 3번까지 재전송(서버 멱등) |
+| 절전 | 깨어나 시계가 30초 넘게 밀려 있으면 연결 신호부터 다시 |
+| 잠금 | 엔진 인자·codex 잠금은 `engines.mjs`(server.mjs 와 공유, 0.3.0과 같은 인자) |
+| 로그 | `~/.local/state/pvre/worker.log` 한 줄 JSON — 작업 id·코드·글자 수·시간만(본문·토큰·작업표 없음) |
+| 토큰 | 파일은 권한 600이 아니면 시작 거부(종료코드 78, launchd 60초 간격 재시도) |
+
+테스트: `node --test test/` (가짜 서버·가짜 엔진, `test/worker.test.mjs`).

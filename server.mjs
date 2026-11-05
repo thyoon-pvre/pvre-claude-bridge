@@ -24,28 +24,22 @@ import { spawn } from 'node:child_process';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import {
   readFileSync, writeFileSync, mkdirSync, existsSync,
-  appendFileSync, accessSync, constants as FS,
+  appendFileSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, dirname, isAbsolute } from 'node:path';
+import { join, dirname } from 'node:path';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { claudeProjectDirFor, claudeToolArgs, claudeToolEnv, isClobeTask, CLOBE_TASKS, judgeToolRun, parseToolStream } from './clobe-tasks.mjs';
+import { expandHome, resolveEngineBin, runClaudeBin, runCodexBin } from './engines.mjs';
+export { codexErrorSummary } from './engines.mjs';
 import { realpathSync } from 'node:fs';
 
-const VERSION = '0.3.0';
+const VERSION = '0.4.0';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 설정 — 전부 환경변수. 기본값은 "운영", verify 모드면 별도 경로로 갈린다.
 // ─────────────────────────────────────────────────────────────────────────────
-
-/** ~ 를 실제 홈으로 편다. 환경변수로 받은 경로에 ~ 가 들어오는 일이 잦다. */
-function expandHome(p) {
-  if (!p) return p;
-  if (p === '~') return homedir();
-  if (p.startsWith('~/')) return join(homedir(), p.slice(2));
-  return p;
-}
 
 // 모드는 기동 시 한 번 정해지고, 이후 어떤 요청으로도 바뀌지 않는다.
 // verify -> prod 로 되돌리는 경로를 코드에 두지 않는다. 검증 프로세스가 운영으로 승격되는 길을 막는다.
@@ -143,24 +137,7 @@ function tokenMatches(given) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 function resolveClaudeBin() {
-  const override = expandHome(IS_CODEX ? process.env.PVRE_CODEX_BIN : process.env.PVRE_CLAUDE_BIN);
-  if (override) return isAbsolute(override) && canExec(override) ? override : null;
-  const dirs = [
-    ...String(process.env.PATH || '').split(':').filter(Boolean),
-    join(homedir(), '.local/bin'),
-    join(homedir(), '.claude/local'),
-    '/opt/homebrew/bin',
-    '/usr/local/bin',
-  ];
-  for (const d of dirs) {
-    const p = join(d, ENGINE);
-    if (canExec(p)) return p;
-  }
-  return null;
-}
-
-function canExec(p) {
-  try { accessSync(p, FS.X_OK); return true; } catch { return false; }
+  return resolveEngineBin(ENGINE);
 }
 
 let CLAUDE_BIN = resolveClaudeBin();
@@ -204,164 +181,17 @@ function enqueue(fn) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// claude -p 실행 — 프롬프트는 argv 가 아니라 stdin 으로 넣는다 (ARG_MAX 회피).
+// 엔진 실행 — engines.mjs(0.4.0, 상시 작업자와 공유). 인자·잠금·오류 요약은 0.3.0 그대로다.
 // ─────────────────────────────────────────────────────────────────────────────
 
 function runClaude(prompt, timeoutMs) {
-  return new Promise((resolve) => {
-    if (DRY_RUN) {
-      resolve({ ok: true, text: `[dry-run] claude 를 실행하지 않았다. prompt ${prompt.length}자.`, exitCode: 0 });
-      return;
-    }
-    if (!CLAUDE_BIN) {
-      CLAUDE_BIN = resolveClaudeBin(); // 설치 직후 재시작 없이 붙게 한 번 더 찾는다.
-      if (!CLAUDE_BIN) {
-        resolve({ ok: false, code: 'CLAUDE_NOT_FOUND', error: 'claude CLI 를 찾지 못했다 (PATH 확인)' });
-        return;
-      }
-    }
-
-    let child;
-    try {
-      child = spawn(CLAUDE_BIN, ['-p', '--output-format', 'text'], {
-        stdio: ['pipe', 'pipe', 'pipe'],
-      });
-    } catch (e) {
-      resolve({ ok: false, code: 'CLAUDE_NOT_FOUND', error: `claude 실행 실패: ${e.message}` });
-      return;
-    }
-
-    let out = '';
-    let err = '';
-    let settled = false;
-    const finish = (r) => { if (!settled) { settled = true; clearTimeout(timer); resolve(r); } };
-
-    const timer = setTimeout(() => {
-      try { child.kill('SIGKILL'); } catch { /* 이미 죽었으면 무시 */ }
-      finish({ ok: false, code: 'TIMEOUT', error: `${timeoutMs}ms 안에 끝나지 않아 중단했다` });
-    }, timeoutMs);
-
-    child.stdout.on('data', (d) => { out += d; });
-    child.stderr.on('data', (d) => { err += d; });
-    child.on('error', (e) => finish({ ok: false, code: 'CLAUDE_NOT_FOUND', error: `claude 실행 실패: ${e.message}` }));
-    child.on('close', (code) => {
-      if (code === 0) finish({ ok: true, text: out, exitCode: 0 });
-      // stderr 를 통째로 돌려주면 그 안에 프롬프트 조각이 실릴 수 있다. 앞 500자만.
-      else finish({ ok: false, code: 'NONZERO_EXIT', error: `claude 종료코드 ${code}: ${err.slice(0, 500)}`, exitCode: code });
-    });
-
-    child.stdin.on('error', (e) => finish({ ok: false, code: 'NONZERO_EXIT', error: `stdin 쓰기 실패: ${e.message}` }));
-    child.stdin.end(prompt);
-  });
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// codex exec 실행 — claude 와 같은 계약(stdin 프롬프트 → 텍스트 응답). 도구를 잠그고 마지막 메시지만 돌려준다.
-// ─────────────────────────────────────────────────────────────────────────────
-
-// 끄는 기능: 셸·코드 실행·하위 에이전트·이미지·브라우저·컴퓨터 제어·플러그인·앱·훅·기억·스킬 검색.
-// codex 버전마다 기능 이름이 다를 수 있다 — 모르는 이름은 codex 가 무시한다(0.162.1 에서 확인).
-const CODEX_DISABLE = [
-  'shell_tool', 'unified_exec', 'code_mode_host', 'multi_agent', 'image_generation', 'browser_use', 'computer_use',
-  'in_app_browser', 'view_image', 'plugins', 'apps', 'hooks', 'memories', 'skill_search', 'tool_suggest', 'goals',
-];
-
-function codexArgs(workDir, outFile) {
-  const args = [
-    'exec',
-    '--ephemeral',               // 세션 기록(~/.codex/sessions)에 메일 원문을 남기지 않는다
-    '--skip-git-repo-check',
-    '--ignore-user-config',      // config.toml 의 MCP 서버(카톡·메일 등)·플러그인·notify 를 싣지 않는다. 인증은 CODEX_HOME 그대로
-    '--ignore-rules',
-    '--sandbox', 'read-only',
-    '-C', workDir,
-    '--color', 'never',
-    '-c', 'project_doc_max_bytes=0',
-    '-c', 'web_search="disabled"',
-    '-o', outFile,
-  ];
-  for (const f of CODEX_DISABLE) args.push('--disable', f);
-  if (process.env.PVRE_CODEX_MODEL) args.push('-m', process.env.PVRE_CODEX_MODEL);
-  if (process.env.PVRE_CODEX_REASONING) args.push('-c', `model_reasoning_effort="${process.env.PVRE_CODEX_REASONING.replace(/[^a-z]/g, '')}"`);
-  args.push('-');                // 프롬프트는 stdin
-  return args;
-}
-
-/**
- * codex 의 stderr 에는 프롬프트가 그대로 다시 찍힌다("user\n<프롬프트>"). 그대로 돌려주면 메일 원문이 오류 메시지로 새어 나간다.
- * codex 로그 형식의 ERROR 줄만 골라 앞 300자만 준다.
- */
-export function codexErrorSummary(stderr) {
-  // 메일 본문에도 "Error:" 같은 줄이 있을 수 있다 → codex 자체 로그 형식(ISO 시각 + ERROR)인 줄만 쓴다.
-  const lines = String(stderr).split('\n').filter((l) => /^\d{4}-\d{2}-\d{2}T[\d:.]+Z\s+ERROR\s/.test(l));
-  return lines.slice(-2).join(' | ').slice(0, 300) || '(codex 로그에 오류 줄 없음 — 터미널에서 codex login status 확인)';
+  if (!CLAUDE_BIN && !DRY_RUN) CLAUDE_BIN = resolveClaudeBin(); // 설치 직후 재시작 없이 붙게 한 번 더 찾는다.
+  return runClaudeBin(CLAUDE_BIN, prompt, timeoutMs, { dryRun: DRY_RUN });
 }
 
 function runCodex(prompt, timeoutMs) {
-  return new Promise((resolve) => {
-    if (DRY_RUN) {
-      resolve({ ok: true, text: `[dry-run] codex 를 실행하지 않았다. prompt ${prompt.length}자.`, exitCode: 0 });
-      return;
-    }
-    if (!CLAUDE_BIN) {
-      CLAUDE_BIN = resolveClaudeBin();
-      if (!CLAUDE_BIN) {
-        resolve({ ok: false, code: 'CODEX_NOT_FOUND', error: 'codex CLI 를 찾지 못했다 (PATH 확인)' });
-        return;
-      }
-    }
-    let workDir;
-    try {
-      workDir = mkdtempSync(join(tmpdir(), 'pvre-codex-'));
-    } catch (e) {
-      resolve({ ok: false, code: 'NONZERO_EXIT', error: `임시 폴더를 만들지 못했다: ${e.message}` });
-      return;
-    }
-    const outFile = join(workDir, 'last-message.txt');
-    const cleanup = () => { try { rmSync(workDir, { recursive: true, force: true }); } catch (e) { console.error(`[bridge] 임시 폴더 정리 실패: ${e.message}`); } };
-
-    let child;
-    try {
-      child = spawn(CLAUDE_BIN, codexArgs(workDir, outFile), {
-        cwd: workDir,
-        stdio: ['pipe', 'pipe', 'pipe'],
-        detached: true, // codex.js → 네이티브 바이너리. 타임아웃 때 프로세스 그룹째 죽인다
-        // codex 는 `#!/usr/bin/env node` 스크립트다. launchd 의 좁은 PATH 에서도 이 node 를 찾게 앞에 붙인다.
-        env: { ...process.env, PATH: `${dirname(process.execPath)}:${process.env.PATH || '/usr/bin:/bin'}` },
-      });
-    } catch (e) {
-      cleanup();
-      resolve({ ok: false, code: 'CODEX_NOT_FOUND', error: `codex 실행 실패: ${e.message}` });
-      return;
-    }
-
-    let err = '';
-    let settled = false;
-    const finish = (r) => { if (!settled) { settled = true; clearTimeout(timer); cleanup(); resolve(r); } };
-    const timer = setTimeout(() => {
-      try { process.kill(-child.pid, 'SIGKILL'); } catch { try { child.kill('SIGKILL'); } catch { /* 이미 끝남 */ } }
-      finish({ ok: false, code: 'TIMEOUT', error: `${timeoutMs}ms 안에 끝나지 않아 중단했다` });
-    }, timeoutMs);
-
-    child.stdout.on('data', () => { /* 진행 출력은 버린다 — 응답은 -o 파일에서만 읽는다 */ });
-    child.stderr.on('data', (d) => { if (err.length < 200_000) err += d; });
-    child.on('error', (e) => finish({ ok: false, code: 'CODEX_NOT_FOUND', error: `codex 실행 실패: ${e.message}` }));
-    child.on('close', (code) => {
-      if (code !== 0) {
-        finish({ ok: false, code: 'NONZERO_EXIT', error: `codex 종료코드 ${code}: ${codexErrorSummary(err)}`, exitCode: code });
-        return;
-      }
-      let text = '';
-      try { text = readFileSync(outFile, 'utf8'); } catch (e) {
-        finish({ ok: false, code: 'NONZERO_EXIT', error: `codex 응답 파일을 읽지 못했다: ${e.message}`, exitCode: 0 });
-        return;
-      }
-      if (!text.trim()) finish({ ok: false, code: 'EMPTY_RESPONSE', error: 'codex 가 빈 응답을 냈다', exitCode: 0 });
-      else finish({ ok: true, text, exitCode: 0 });
-    });
-    child.stdin.on('error', (e) => finish({ ok: false, code: 'NONZERO_EXIT', error: `stdin 쓰기 실패: ${e.message}` }));
-    child.stdin.end(prompt);
-  });
+  if (!CLAUDE_BIN && !DRY_RUN) CLAUDE_BIN = resolveClaudeBin();
+  return runCodexBin(CLAUDE_BIN, prompt, timeoutMs, { dryRun: DRY_RUN });
 }
 
 const runEngine = IS_CODEX ? runCodex : runClaude;

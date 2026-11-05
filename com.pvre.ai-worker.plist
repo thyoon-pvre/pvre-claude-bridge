@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- install-worker.sh 가 자리표시자(node 경로·저장소 위치·서버 주소·엔진·토큰 위치)를 실제 값으로 바꿔 ~/Library/LaunchAgents 에 쓴다.
+     토큰 값은 이 파일에 넣지 않는다 — 토큰 파일 경로 또는 키체인 서비스 이름만. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.pvre.ai-worker</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>@NODE_BIN@</string>
+    <string>@BRIDGE_DIR@/worker.mjs</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PVRE_WORKER_SERVER</key>
+    <string>@SERVER@</string>
+    <key>PVRE_WORKER_ENGINE</key>
+    <string>@ENGINE@</string>
+    <key>@TOKEN_ENV_KEY@</key>
+    <string>@TOKEN_ENV_VALUE@</string>
+    <!-- launchd 의 PATH 는 좁다. claude·codex·node 가 있는 경로를 직접 넣어 준다. -->
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:@HOME@/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+
+  <!-- 로그인하면 시작, 죽으면 다시 띄운다. 설정 오류(종료코드 78)로 계속 죽으면 60초 간격으로만 다시 시도 -->
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>60</integer>
+  <!-- 백그라운드 작업이라 절전을 막지 않는다. 깨어나면 작업자가 스스로 연결 신호부터 다시 보낸다 -->
+  <key>ProcessType</key>
+  <string>Background</string>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/pvre-ai-worker.out</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/pvre-ai-worker.err</string>
+</dict>
+</plist>
