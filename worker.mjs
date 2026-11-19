@@ -19,7 +19,7 @@ import { fileURLToPath } from 'node:url';
 import { expandHome, resolveEngineBin, runClaudeBin, runCodexBin } from './engines.mjs';
 import { createWorker, validServerUrl } from './worker-core.mjs';
 
-const VERSION = '0.4.0';
+const VERSION = '0.5.0';
 const ENGINE = process.env.PVRE_WORKER_ENGINE === 'codex' ? 'codex' : 'claude';
 const LOG_FILE = expandHome(process.env.PVRE_WORKER_LOG_FILE || join(homedir(), '.local/state/pvre/worker.log'));
 const TOKEN_FILE = expandHome(process.env.PVRE_WORKER_TOKEN_FILE || join(homedir(), '.config/pvre/worker-token'));
@@ -35,9 +35,19 @@ function log(entry) {
   }
 }
 
-/** 토큰: 키체인(설정 시) → 파일(600). 값은 출력하지 않는다 */
+/**
+ * 파일 권한이 그룹·기타에 열려 있는가. 윈도우는 mode 비트가 ACL 을 나타내지 않는다(늘 0o666 류로 보인다) → 검사하지 않는다.
+ * 윈도우에서는 설치 스크립트가 icacls 로 사용자 전용 ACL 을 건다.
+ */
+export function tokenModeTooOpen(mode, platform = process.platform) {
+  if (platform === 'win32') return false;
+  return Boolean(mode & 0o077);
+}
+
+/** 토큰: 키체인(설정 시, 맥 전용) → 파일(600). 값은 출력하지 않는다 */
 export function loadToken() {
   const svc = process.env.PVRE_WORKER_KEYCHAIN_SERVICE;
+  if (svc && process.platform !== 'darwin') throw new Error('PVRE_WORKER_KEYCHAIN_SERVICE 는 macOS 에서만 쓴다. 토큰 파일(PVRE_WORKER_TOKEN_FILE)을 써라');
   if (svc) {
     try {
       return execFileSync('/usr/bin/security', ['find-generic-password', '-s', svc, '-w'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
@@ -47,7 +57,7 @@ export function loadToken() {
   }
   if (!existsSync(TOKEN_FILE)) throw new Error(`토큰 파일이 없다: ${TOKEN_FILE}`);
   const mode = statSync(TOKEN_FILE).mode & 0o777;
-  if (mode & 0o077) throw new Error(`토큰 파일 권한이 너무 넓다(${mode.toString(8)}). chmod 600 ${TOKEN_FILE}`);
+  if (tokenModeTooOpen(mode)) throw new Error(`토큰 파일 권한이 너무 넓다(${mode.toString(8)}). chmod 600 ${TOKEN_FILE}`);
   return readFileSync(TOKEN_FILE, 'utf8').trim();
 }
 

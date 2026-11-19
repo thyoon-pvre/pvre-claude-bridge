@@ -126,7 +126,7 @@ test('데몬: 기존 작업(reply-parse)은 0.2.0과 같은 인자, 클로브 �
   const b = await startBridge({ FAKE_STREAM: streamFile, FAKE_PERSIST: '1', HOME: home });
   try {
     const h = await (await fetch(`http://127.0.0.1:${b.port}/v1/health`)).json();
-    assert.equal(h.version, '0.4.0');
+    assert.equal(h.version, '0.5.0');
     assert.deepEqual(h.tasks, ['clobe.pull_invoices', 'clobe.pull_bank']);
     const r1 = await run(b.port, { app: 'pvre-order', task: 'reply-parse', prompt: 'hello' });
     assert.equal(r1.body.ok, true);

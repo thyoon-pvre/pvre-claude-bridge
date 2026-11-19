@@ -20,7 +20,6 @@
 //  - 포트·토큰·로그 경로를 하드코딩하지 않는다. 전부 환경변수 기본값이다 — 운영/검증 격리 때문이다.
 
 import { createServer } from 'node:http';
-import { spawn } from 'node:child_process';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import {
   readFileSync, writeFileSync, mkdirSync, existsSync,
@@ -31,11 +30,12 @@ import { join, dirname } from 'node:path';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { claudeProjectDirFor, claudeToolArgs, claudeToolEnv, isClobeTask, CLOBE_TASKS, judgeToolRun, parseToolStream } from './clobe-tasks.mjs';
-import { expandHome, resolveEngineBin, runClaudeBin, runCodexBin } from './engines.mjs';
+import { expandHome, killEngine, resolveEngineBin, runClaudeBin, runCodexBin, spawnEngine } from './engines.mjs';
 export { codexErrorSummary } from './engines.mjs';
 import { realpathSync } from 'node:fs';
 
-const VERSION = '0.4.0';
+const VERSION = '0.5.0';
+const IS_WIN = process.platform === 'win32';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 설정 — 전부 환경변수. 기본값은 "운영", verify 모드면 별도 경로로 갈린다.
@@ -85,7 +85,8 @@ const BUILTIN_ORIGINS = [
 function loadConfigFile() {
   try {
     if (!existsSync(CONFIG_FILE)) return {};
-    return JSON.parse(readFileSync(CONFIG_FILE, 'utf8'));
+    // 윈도우 메모장·PowerShell 5.1 이 붙이는 BOM 을 떼고 읽는다(BOM 이 있으면 JSON.parse 가 실패해 허용 주소가 통째로 빠진다)
+    return JSON.parse(readFileSync(CONFIG_FILE, 'utf8').replace(/^\uFEFF/, ''));
   } catch (e) {
     // 설정 파일이 깨졌다고 브리지가 죽으면 안 된다. 다만 조용히 넘기지도 않는다.
     console.error(`[bridge] 설정 파일을 읽지 못했다 (${CONFIG_FILE}): ${e.message}`);
@@ -133,7 +134,7 @@ function tokenMatches(given) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// claude 바이너리 위치 — launchd 의 PATH 는 좁다. 직접 찾아 절대경로로 실행한다.
+// claude 바이너리 위치 — launchd·작업 스케줄러의 PATH 는 좁다. 직접 찾아 절대경로로 실행한다(윈도우 .cmd 는 engines.mjs 가 푼다).
 // ─────────────────────────────────────────────────────────────────────────────
 
 function resolveClaudeBin() {
@@ -226,7 +227,7 @@ function runClaudeTools(task, prompt, timeoutMs) {
     };
     let child;
     try {
-      child = spawn(CLAUDE_BIN, claudeToolArgs(task), { cwd: workDir, stdio: ['pipe', 'pipe', 'pipe'], env: claudeToolEnv() });
+      child = spawnEngine(CLAUDE_BIN, claudeToolArgs(task), { cwd: workDir, stdio: ['pipe', 'pipe', 'pipe'], env: claudeToolEnv() });
     } catch (e) {
       cleanup();
       resolve({ ok: false, code: 'CLAUDE_NOT_FOUND', error: `claude 실행 실패: ${e.message}` });
@@ -237,13 +238,13 @@ function runClaudeTools(task, prompt, timeoutMs) {
     let settled = false;
     const finish = (r) => { if (!settled) { settled = true; clearTimeout(timer); cleanup(); resolve(r); } };
     const timer = setTimeout(() => {
-      try { child.kill('SIGKILL'); } catch { /* 이미 끝남 */ }
+      killEngine(child);
       finish({ ok: false, code: 'TIMEOUT', error: `${timeoutMs}ms 안에 끝나지 않아 중단했다` });
     }, timeoutMs);
     child.stdout.on('data', (d) => {
       out += d;
       if (out.length > MAX_TOOL_STDOUT) {
-        try { child.kill('SIGKILL'); } catch { /* 이미 끝남 */ }
+        killEngine(child);
         finish({ ok: false, code: 'OUTPUT_TOO_LARGE', error: '클로브 조회 결과가 8MB를 넘었다 — 기간을 줄여 다시 요청하세요' });
       }
     });
@@ -449,7 +450,10 @@ server.listen(PORT, HOST, () => {
   console.log(`[bridge] 로그 파일 : ${LOG_FILE}`);
   console.log(`[bridge] ${ENGINE.padEnd(6)}    : ${CLAUDE_BIN || `찾지 못함 — ${ENGINE} CLI 설치 확인`}`);
   console.log(`[bridge] 허용 Origin: ${[...ALLOWED_ORIGINS].join(', ') || '(없음)'}`);
-  if (TOKEN_CREATED && IS_CODEX) {
+  if (TOKEN_CREATED && IS_WIN) {
+    // 윈도우는 작업 스케줄러가 출력을 로그 파일로 돌린다 — 엔진과 상관없이 값은 찍지 않는다.
+    console.log(`[bridge] 토큰을 새로 만들었다(값은 출력하지 않는다): Get-Content "${TOKEN_FILE}" | Set-Clipboard`);
+  } else if (TOKEN_CREATED && IS_CODEX) {
     // codex 엔진은 토큰을 화면·launchd 로그(/tmp/*.out)에 찍지 않는다. 파일에서 클립보드로 복사하게 안내만 한다.
     console.log(`[bridge] 토큰을 새로 만들었다(값은 출력하지 않는다): pbcopy < ${TOKEN_FILE}`);
   } else if (TOKEN_CREATED) {
@@ -458,7 +462,7 @@ server.listen(PORT, HOST, () => {
     console.log(`  ${TOKEN}`);
     console.log('');
   } else {
-    console.log(`[bridge] 토큰은 이미 있다. 값이 필요하면: cat ${TOKEN_FILE}`);
+    console.log(`[bridge] 토큰은 이미 있다. 값이 필요하면: ${IS_WIN ? `Get-Content "${TOKEN_FILE}" | Set-Clipboard` : `cat ${TOKEN_FILE}`}`);
   }
   log({ event: 'listen', port: PORT, ok: true });
 });

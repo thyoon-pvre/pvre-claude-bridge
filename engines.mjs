@@ -3,16 +3,17 @@
 //  claude : `claude -p --output-format text` (프롬프트는 stdin). 0.1.0부터 같은 인자.
 //  codex  : `codex exec` 잠금 실행(사용자 config·MCP·셸·웹 검색·하위 에이전트 끔, 읽기 전용 샌드박스, 빈 임시 폴더, --ephemeral). 0.2.0과 같은 인자.
 // 프롬프트·응답 본문은 여기서 어디에도 쓰지 않는다(로그 없음). 오류 문구는 stderr 앞부분만(codex 는 프롬프트가 stderr 에 다시 찍혀 ERROR 줄만).
+// 윈도우(v0.5.0): .cmd 래퍼를 shell 없이 풀어 실행한다(spawnPlan). 맥 동작은 그대로.
 // 런타임 의존성 0.
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { accessSync, constants as FS, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { dirname, isAbsolute, join } from 'node:path';
+import { join, posix, win32 } from 'node:path';
 
 export function expandHome(p) {
   if (!p) return p;
   if (p === '~') return homedir();
-  if (p.startsWith('~/')) return join(homedir(), p.slice(2));
+  if (p.startsWith('~/') || p.startsWith('~\\')) return join(homedir(), p.slice(2));
   return p;
 }
 
@@ -20,22 +21,129 @@ export function canExec(p) {
   try { accessSync(p, FS.X_OK); return true; } catch { return false; }
 }
 
-/** 엔진 바이너리 절대경로. override(PVRE_CLAUDE_BIN·PVRE_CODEX_BIN)가 있으면 그것만(절대경로·실행 가능일 때) */
-export function resolveEngineBin(engine, override = engine === 'codex' ? process.env.PVRE_CODEX_BIN : process.env.PVRE_CLAUDE_BIN) {
-  const o = expandHome(override);
-  if (o) return isAbsolute(o) && canExec(o) ? o : null;
+// ─────────────────────────────────────────────────────────────────────────────
+// 플랫폼 대응(v0.5.0 윈도우). 맥(darwin)·리눅스 동작은 0.4.0 그대로다 — 윈도우 분기만 더했다.
+//  윈도우의 npm 전역 설치 CLI 는 claude.cmd·codex.cmd(배치 래퍼)다. Node 는 .cmd 를 shell 없이 spawn 하지 못하고(EINVAL),
+//  shell:true 로 돌리면 cmd.exe 가 인자를 다시 해석한다(인자 주입 위험). 그래서 .cmd 안에 적힌 실제 대상(cli.js·codex.js·*.exe)을
+//  읽어 node(현재 실행 중인 node) 또는 그 exe 를 shell 없이 직접 실행한다. 프롬프트는 계속 stdin 으로만 넘긴다.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const pathApi = (platform) => (platform === 'win32' ? win32 : posix);
+
+/** env 안의 PATH 키 이름(윈도우는 보통 'Path'). 없으면 'PATH' */
+export function pathKeyOf(env, platform = process.platform) {
+  if (platform !== 'win32') return 'PATH';
+  return Object.keys(env).find((k) => k.toUpperCase() === 'PATH') || 'PATH';
+}
+
+/** 엔진 바이너리 후보 경로(순서대로). 실행 가능 여부는 보지 않는다 — 테스트가 이 목록을 고정한다 */
+export function engineCandidates(engine, { platform = process.platform, env = process.env, home = homedir() } = {}) {
+  const P = pathApi(platform);
+  const pathDirs = String(env[pathKeyOf(env, platform)] || '').split(P.delimiter).map((d) => d.trim().replace(/^"(.*)"$/, '$1')).filter(Boolean);
+  if (platform === 'win32') {
+    const dirs = [
+      ...pathDirs,
+      P.join(home, '.local', 'bin'),                                // Claude Code 네이티브 설치(claude.exe)
+      env.APPDATA ? P.join(env.APPDATA, 'npm') : P.join(home, 'AppData', 'Roaming', 'npm'), // npm 전역(claude.cmd·codex.cmd)
+    ];
+    // .exe 를 .cmd 보다 먼저 — 같은 폴더에 둘 다 있으면 래퍼 해석이 필요 없는 쪽을 쓴다. 확장자 없는 파일(npm 의 sh 래퍼)은 실행할 수 없어 뺀다.
+    return dirs.flatMap((d) => [P.join(d, `${engine}.exe`), P.join(d, `${engine}.cmd`)]);
+  }
   const dirs = [
-    ...String(process.env.PATH || '').split(':').filter(Boolean),
-    join(homedir(), '.local/bin'),
-    join(homedir(), '.claude/local'),
+    ...pathDirs,
+    P.join(home, '.local/bin'),
+    P.join(home, '.claude/local'),
     '/opt/homebrew/bin',
     '/usr/local/bin',
   ];
-  for (const d of dirs) {
-    const p = join(d, engine);
-    if (canExec(p)) return p;
+  return dirs.map((d) => P.join(d, engine));
+}
+
+/** 엔진 바이너리 절대경로. override(PVRE_CLAUDE_BIN·PVRE_CODEX_BIN)가 있으면 그것만(절대경로·실행 가능일 때) */
+export function resolveEngineBin(
+  engine,
+  override = engine === 'codex' ? process.env.PVRE_CODEX_BIN : process.env.PVRE_CLAUDE_BIN,
+  { platform = process.platform, env = process.env, home = homedir(), exists = canExec } = {},
+) {
+  const o = expandHome(override);
+  if (o) return pathApi(platform).isAbsolute(o) && exists(o) ? o : null;
+  for (const p of engineCandidates(engine, { platform, env, home })) {
+    if (exists(p)) return p;
   }
   return null;
+}
+
+/**
+ * npm cmd-shim(.cmd) 안의 실제 실행 대상. 예:
+ *   ... "%_prog%"  "%dp0%\node_modules\@anthropic-ai\claude-code\cli.js" %*
+ *   ... "%dp0%\node_modules\@anthropic-ai\claude-code\bin\claude.exe"   %*
+ * 마지막 "%dp0%\…" %* 를 쓴다. 못 찾으면 null.
+ */
+export function parseCmdShim(text, shimPath) {
+  const re = /"%~?dp0%?\\?([^"]+)"\s*%\*/g;
+  let m;
+  let last = null;
+  while ((m = re.exec(String(text))) !== null) last = m[1];
+  if (!last) return null;
+  return win32.join(win32.dirname(shimPath), last);
+}
+
+const SCRIPT_EXT = /\.(c|m)?js$/i;
+
+/**
+ * 실제로 spawn 할 명령. shell 은 언제나 false 다.
+ *  - 맥·리눅스: bin 그대로(0.4.0 과 같다)
+ *  - 윈도우 *.js : 현재 node 로 실행
+ *  - 윈도우 *.cmd/*.bat : 래퍼 안의 대상을 읽어 node 또는 exe 로 실행. 해석 못 하면 Error(code ENGINE_SHIM)
+ */
+export function spawnPlan(bin, args, { platform = process.platform, nodePath = process.execPath, readFile = (p) => readFileSync(p, 'utf8') } = {}) {
+  if (platform !== 'win32') return { command: bin, args };
+  if (SCRIPT_EXT.test(bin)) return { command: nodePath, args: [bin, ...args] };
+  if (/\.(cmd|bat)$/i.test(bin)) {
+    let target = null;
+    try { target = parseCmdShim(readFile(bin), bin); } catch (e) {
+      const err = new Error(`${bin} 를 읽지 못했다: ${e.message}`);
+      err.code = 'ENGINE_SHIM';
+      throw err;
+    }
+    if (target && SCRIPT_EXT.test(target)) return { command: nodePath, args: [target, ...args] };
+    if (target && /\.exe$/i.test(target)) return { command: target, args };
+    const err = new Error(`${bin} 안에서 실행 대상(cli.js·*.exe)을 찾지 못했다. PVRE_CLAUDE_BIN/PVRE_CODEX_BIN 에 .exe 또는 .js 절대경로를 지정해라`);
+    err.code = 'ENGINE_SHIM';
+    throw err;
+  }
+  return { command: bin, args };
+}
+
+/** 엔진 프로세스 실행 — 플랫폼 차이(.cmd 래퍼·콘솔 창 숨김)를 여기서만 흡수한다. shell 은 쓰지 않는다 */
+export function spawnEngine(bin, args, options = {}) {
+  const plan = spawnPlan(bin, args);
+  return spawn(plan.command, plan.args, { ...options, shell: false, windowsHide: true });
+}
+
+/** 타임아웃 때 프로세스를 끝낸다. 윈도우는 taskkill /T 로 자식(codex.exe 등)까지, 그 밖은 group 이면 프로세스 그룹째 */
+export function killEngine(child, { group = false, platform = process.platform } = {}) {
+  if (!child || !child.pid) return;
+  if (platform === 'win32') {
+    execFile('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true }, (e) => {
+      if (e) { try { child.kill(); } catch { /* 이미 끝남 */ } }
+    });
+    return;
+  }
+  if (group) {
+    try { process.kill(-child.pid, 'SIGKILL'); return; } catch { /* 그룹이 없으면 아래 */ }
+  }
+  try { child.kill('SIGKILL'); } catch { /* 이미 끝남 */ }
+}
+
+/** codex 실행 env: 지금 node 가 있는 폴더를 PATH 맨 앞에(launchd·작업 스케줄러의 좁은 PATH 대비) */
+export function envWithNodeOnPath(base = process.env, { platform = process.platform, nodePath = process.execPath } = {}) {
+  const P = pathApi(platform);
+  const key = pathKeyOf(base, platform);
+  const fallback = platform === 'win32' ? '' : '/usr/bin:/bin';
+  const env = { ...base };
+  env[key] = `${P.dirname(nodePath)}${P.delimiter}${base[key] || fallback}`;
+  return env;
 }
 
 /** claude -p 실행 — 프롬프트는 argv 가 아니라 stdin 으로 넣는다 (ARG_MAX 회피). */
@@ -51,7 +159,7 @@ export function runClaudeBin(bin, prompt, timeoutMs, { dryRun = false } = {}) {
     }
     let child;
     try {
-      child = spawn(bin, ['-p', '--output-format', 'text'], { stdio: ['pipe', 'pipe', 'pipe'] });
+      child = spawnEngine(bin, ['-p', '--output-format', 'text'], { stdio: ['pipe', 'pipe', 'pipe'] });
     } catch (e) {
       resolve({ ok: false, code: 'CLAUDE_NOT_FOUND', error: `claude 실행 실패: ${e.message}` });
       return;
@@ -61,7 +169,7 @@ export function runClaudeBin(bin, prompt, timeoutMs, { dryRun = false } = {}) {
     let settled = false;
     const finish = (r) => { if (!settled) { settled = true; clearTimeout(timer); resolve(r); } };
     const timer = setTimeout(() => {
-      try { child.kill('SIGKILL'); } catch { /* 이미 죽었으면 무시 */ }
+      killEngine(child);
       finish({ ok: false, code: 'TIMEOUT', error: `${timeoutMs}ms 안에 끝나지 않아 중단했다` });
     }, timeoutMs);
     child.stdout.on('data', (d) => { out += d; });
@@ -136,12 +244,13 @@ export function runCodexBin(bin, prompt, timeoutMs, { dryRun = false } = {}) {
     const cleanup = () => { try { rmSync(workDir, { recursive: true, force: true }); } catch (e) { console.error(`[bridge] 임시 폴더 정리 실패: ${e.message}`); } };
     let child;
     try {
-      child = spawn(bin, codexArgs(workDir, outFile), {
+      child = spawnEngine(bin, codexArgs(workDir, outFile), {
         cwd: workDir,
         stdio: ['pipe', 'pipe', 'pipe'],
-        detached: true, // codex.js → 네이티브 바이너리. 타임아웃 때 프로세스 그룹째 죽인다
-        // codex 는 `#!/usr/bin/env node` 스크립트다. launchd 의 좁은 PATH 에서도 이 node 를 찾게 앞에 붙인다.
-        env: { ...process.env, PATH: `${dirname(process.execPath)}:${process.env.PATH || '/usr/bin:/bin'}` },
+        // codex.js → 네이티브 바이너리. 타임아웃 때 프로세스 그룹째 죽인다. 윈도우는 detached 면 새 콘솔이 생겨 끄고 taskkill /T 로 죽인다
+        detached: process.platform !== 'win32',
+        // codex 는 `#!/usr/bin/env node` 스크립트다. launchd·작업 스케줄러의 좁은 PATH 에서도 이 node 를 찾게 앞에 붙인다.
+        env: envWithNodeOnPath(process.env),
       });
     } catch (e) {
       cleanup();
@@ -152,7 +261,7 @@ export function runCodexBin(bin, prompt, timeoutMs, { dryRun = false } = {}) {
     let settled = false;
     const finish = (r) => { if (!settled) { settled = true; clearTimeout(timer); cleanup(); resolve(r); } };
     const timer = setTimeout(() => {
-      try { process.kill(-child.pid, 'SIGKILL'); } catch { try { child.kill('SIGKILL'); } catch { /* 이미 끝남 */ } }
+      killEngine(child, { group: true });
       finish({ ok: false, code: 'TIMEOUT', error: `${timeoutMs}ms 안에 끝나지 않아 중단했다` });
     }, timeoutMs);
     child.stdout.on('data', () => { /* 진행 출력은 버린다 — 응답은 -o 파일에서만 읽는다 */ });
